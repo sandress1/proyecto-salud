@@ -275,6 +275,8 @@ def whatsapp():
             "4. Registrar PQR o comentario"
         )
 
+
+
     if current_step == "BOOK_SELECT_SPECIALTY":
         temp_data = session["temp_data"]
 
@@ -295,15 +297,75 @@ def whatsapp():
             {"specialty_id": selected_specialty_id}
         ).mappings().first()
 
+        doctors = db.session.execute(
+            db.text("""
+                SELECT id, full_name
+                FROM doctors
+                WHERE specialty_id = :specialty_id
+                AND is_active = TRUE
+                ORDER BY id
+            """),
+            {"specialty_id": selected_specialty_id}
+        ).mappings().all()
+
+        if not doctors:
+            return send_message(
+                f"La especialidad {specialty['name']} no tiene médicos disponibles en este momento.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        options_text = f"Especialidad seleccionada: {specialty['name']}.\n\n"
+        options_text += "Seleccione un médico:\n\n"
+
+        temp_doctors = {
+            "specialty_id": selected_specialty_id,
+            "doctors": {}
+        }
+
+        for index, doctor in enumerate(doctors, start=1):
+            options_text += f"{index}. {doctor['full_name']}\n"
+            temp_doctors["doctors"][str(index)] = doctor["id"]
+
         update_session(
             sender_number,
-            current_step="BOOK_SPECIALTY_SELECTED",
-            temp_data=f'{{"specialty_id": {selected_specialty_id}}}'
+            current_step="BOOK_SELECT_DOCTOR",
+            temp_data=str(temp_doctors).replace("'", '"')
+        )
+
+        return send_message(options_text)
+
+    if current_step == "BOOK_SELECT_DOCTOR":
+        temp_data = session["temp_data"]
+
+        doctors_map = temp_data.get("doctors", {})
+        selected_doctor_id = doctors_map.get(incoming_message)
+
+        if not selected_doctor_id:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione un médico escribiendo solo el número correspondiente."
+            )
+
+        doctor = db.session.execute(
+            db.text("""
+                SELECT id, full_name
+                FROM doctors
+                WHERE id = :doctor_id
+            """),
+            {"doctor_id": selected_doctor_id}
+        ).mappings().first()
+
+        specialty_id = temp_data.get("specialty_id")
+
+        update_session(
+            sender_number,
+            current_step="BOOK_DOCTOR_SELECTED",
+            temp_data=f'{{"specialty_id": {specialty_id}, "doctor_id": {selected_doctor_id}}}'
         )
 
         return send_message(
-            f"Especialidad seleccionada: {specialty['name']}.\n\n"
-            "En el siguiente paso se mostrarán los médicos disponibles para esta especialidad."
+            f"Médico seleccionado: {doctor['full_name']}.\n\n"
+            "En el siguiente paso se mostrarán los horarios disponibles para este médico."
         )
 
     return send_message(
