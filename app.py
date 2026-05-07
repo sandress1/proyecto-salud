@@ -212,11 +212,38 @@ def whatsapp():
 
     if current_step == "MAIN_MENU":
         if incoming_message == "1":
-            update_session(sender_number, current_step="BOOK_START", selected_option="book")
-            return send_message(
-                "Ha seleccionado: Agendar cita médica.\n\n"
-                "Este flujo se desarrollará en el siguiente día del proyecto."
+            specialties = db.session.execute(
+                db.text("""
+                    SELECT id, name
+                    FROM specialties
+                    WHERE is_active = TRUE
+                    ORDER BY id
+                """)
+            ).mappings().all()
+
+            if not specialties:
+                return send_message(
+                    "En este momento no hay especialidades disponibles.\n\n"
+                    "Por favor, intente más tarde."
+                )
+
+            options_text = "Ha seleccionado: Agendar cita médica.\n\n"
+            options_text += "Seleccione una especialidad:\n\n"
+
+            temp_specialties = {}
+
+            for index, specialty in enumerate(specialties, start=1):
+                options_text += f"{index}. {specialty['name']}\n"
+                temp_specialties[str(index)] = specialty["id"]
+
+            update_session(
+                sender_number,
+                current_step="BOOK_SELECT_SPECIALTY",
+                selected_option="book",
+                temp_data=str(temp_specialties).replace("'", '"')
             )
+
+            return send_message(options_text)
 
         if incoming_message == "2":
             update_session(sender_number, current_step="MODIFY_START", selected_option="modify")
@@ -248,11 +275,41 @@ def whatsapp():
             "4. Registrar PQR o comentario"
         )
 
+    if current_step == "BOOK_SELECT_SPECIALTY":
+        temp_data = session["temp_data"]
+
+        selected_specialty_id = temp_data.get(incoming_message)
+
+        if not selected_specialty_id:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione una especialidad escribiendo solo el número correspondiente."
+            )
+
+        specialty = db.session.execute(
+            db.text("""
+                SELECT id, name
+                FROM specialties
+                WHERE id = :specialty_id
+            """),
+            {"specialty_id": selected_specialty_id}
+        ).mappings().first()
+
+        update_session(
+            sender_number,
+            current_step="BOOK_SPECIALTY_SELECTED",
+            temp_data=f'{{"specialty_id": {selected_specialty_id}}}'
+        )
+
+        return send_message(
+            f"Especialidad seleccionada: {specialty['name']}.\n\n"
+            "En el siguiente paso se mostrarán los médicos disponibles para esta especialidad."
+        )
+
     return send_message(
         "No entendí su mensaje.\n\n"
         "Escriba 'hola' para iniciar nuevamente."
     )
-
 
 if __name__ == "__main__":
     app.run(debug=True)
