@@ -48,6 +48,10 @@ CREATE TABLE appointments (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE UNIQUE INDEX uq_appointments_active_slot
+ON appointments (slot_id)
+WHERE status = 'booked';
+
 CREATE TABLE chat_sessions (
     id SERIAL PRIMARY KEY,
     whatsapp_number VARCHAR(50) UNIQUE NOT NULL,

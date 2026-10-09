@@ -1,6 +1,9 @@
 import os
 from datetime import datetime
 
+import logging
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+
 from dotenv import load_dotenv
 from flask import Flask, request
 from flask_sqlalchemy import SQLAlchemy
@@ -93,6 +96,90 @@ def reset_session(whatsapp_number):
     )
     db.session.commit()
 
+
+
+def book_appointment(patient_id, doctor_id, slot_id):
+ 
+    try:
+    
+        slot = db.session.execute(
+            db.text("""
+                SELECT id, doctor_id
+                FROM slots
+                WHERE id = :slot_id
+                  AND doctor_id = :doctor_id
+                  AND is_available = TRUE
+                  AND start_time > CURRENT_TIMESTAMP
+                FOR UPDATE
+            """),
+            {
+                "slot_id": slot_id,
+                "doctor_id": doctor_id
+            }
+        ).mappings().first()
+
+        if not slot:
+            db.session.rollback()
+            return "unavailable", None
+
+        existing = db.session.execute(
+            db.text("""
+                SELECT id
+                FROM appointments
+                WHERE slot_id = :slot_id
+                  AND status = 'booked'
+            """),
+            {"slot_id": slot_id}
+        ).first()
+
+        if existing:
+            db.session.rollback()
+            return "unavailable", None
+
+        appointment_id = db.session.execute(
+            db.text("""
+                INSERT INTO appointments (
+                    patient_id,
+                    doctor_id,
+                    slot_id,
+                    status
+                )
+                VALUES (
+                    :patient_id,
+                    :doctor_id,
+                    :slot_id,
+                    'booked'
+                )
+                RETURNING id
+            """),
+            {
+                "patient_id": patient_id,
+                "doctor_id": doctor_id,
+                "slot_id": slot_id
+            }
+        ).scalar_one()
+
+        db.session.execute(
+            db.text("""
+                UPDATE slots
+                SET is_available = FALSE
+                WHERE id = :slot_id
+            """),
+            {"slot_id": slot_id}
+        )
+
+        db.session.commit()
+
+        return "success", appointment_id
+
+    except IntegrityError:
+        db.session.rollback()
+        return "unavailable", None
+
+    except SQLAlchemyError:
+        db.session.rollback()
+        logging.exception("Error al reservar cita")
+        return "error", None
 
 def main_menu(patient_name):
     return (
@@ -468,18 +555,145 @@ def whatsapp():
             temp_data=json.dumps(new_temp_data)
         )
 
+      
+
+        details = db.session.execute(
+            db.text("""
+                SELECT d.full_name AS doctor_name,
+                       sp.name AS specialty_name
+                FROM doctors d
+                JOIN specialties sp
+                    ON sp.id = d.specialty_id
+                WHERE d.id = :doctor_id
+            """),
+            {"doctor_id": temp_data.get("doctor_id")}
+        ).mappings().first()
+
         date_text = slot["start_time"].strftime("%d/%m/%Y")
         time_text = slot["start_time"].strftime("%H:%M")
 
         return send_message(
-            "Horario seleccionado correctamente.\n\n"
+            "Resumen de su cita médica:\n\n"
+            f"Especialidad: {details['specialty_name']}\n"
+            f"Médico: {details['doctor_name']}\n"
             f"Fecha: {date_text}\n"
             f"Hora: {time_text}\n\n"
-            "Su cita todavía NO ha sido reservada.\n"
-            "La confirmación se implementará "
-            "en el siguiente paso del proyecto."
+            "¿Desea confirmar esta cita?\n\n"
+            "1. Sí, confirmar cita\n"
+            "2. No, cancelar proceso\n\n"
+            "Responda con 1 o 2."
         )
+
+
+
+
+
         return send_message(options_text)
+
+    
+
+
+
+    if current_step == "BOOK_SLOT_SELECTED":
+
+        if incoming_message == "2":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="book",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "El proceso de agendamiento fue cancelado.\n\n"
+                "No se ha reservado ninguna cita.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        if incoming_message != "1":
+            return send_message(
+                "Opción no válida.\n\n"
+                "1. Sí, confirmar cita\n"
+                "2. No, cancelar proceso"
+            )
+
+        temp_data = session["temp_data"]
+
+        patient_id = session["patient_id"]
+        doctor_id = temp_data.get("doctor_id")
+        slot_id = temp_data.get("slot_id")
+
+        if not patient_id or not doctor_id or not slot_id:
+            reset_session(sender_number)
+            return send_message(
+                "No fue posible recuperar los datos de su cita.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        status, appointment_id = book_appointment(
+            patient_id,
+            doctor_id,
+            slot_id
+        )
+
+        if status == "unavailable":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="book",
+                temp_data="{}"
+            )
+            return send_message(
+                "Lo sentimos. El horario seleccionado "
+                "ya no está disponible.\n\n"
+                "No se realizó ninguna reserva.\n\n"
+                "Escriba 'hola' para elegir otro horario."
+            )
+
+        if status == "error":
+            return send_message(
+                "Ocurrió un error al intentar agendar su cita.\n\n"
+                "No se pudo confirmar la reserva.\n"
+                "Por favor, intente nuevamente."
+            )
+
+        appointment = db.session.execute(
+            db.text("""
+                SELECT a.id,
+                       d.full_name AS doctor_name,
+                       sp.name AS specialty_name,
+                       s.start_time
+                FROM appointments a
+                JOIN doctors d ON d.id = a.doctor_id
+                JOIN specialties sp ON sp.id = d.specialty_id
+                JOIN slots s ON s.id = a.slot_id
+                WHERE a.id = :appointment_id
+            """),
+            {"appointment_id": appointment_id}
+        ).mappings().first()
+
+        date_text = appointment["start_time"].strftime("%d/%m/%Y")
+        time_text = appointment["start_time"].strftime("%H:%M")
+
+        update_session(
+            sender_number,
+            current_step="MAIN_MENU",
+            selected_option="book",
+            temp_data="{}"
+        )
+
+        return send_message(
+            "¡Cita médica agendada exitosamente!\n\n"
+            f"Número de cita: {appointment_id}\n"
+            f"Especialidad: {appointment['specialty_name']}\n"
+            f"Médico: {appointment['doctor_name']}\n"
+            f"Fecha: {date_text}\n"
+            f"Hora: {time_text}\n\n"
+            "Su cita ha quedado confirmada.\n\n"
+            "Escriba 'hola' para iniciar nuevamente."
+        )
+
+
     return send_message(
         "No entendí su mensaje.\n\n"
         "Escriba 'hola' para iniciar nuevamente."
