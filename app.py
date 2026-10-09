@@ -334,6 +334,7 @@ def whatsapp():
 
         return send_message(options_text)
 
+
     if current_step == "BOOK_SELECT_DOCTOR":
         temp_data = session["temp_data"]
 
@@ -351,23 +352,134 @@ def whatsapp():
                 SELECT id, full_name
                 FROM doctors
                 WHERE id = :doctor_id
+                AND is_active = TRUE
             """),
             {"doctor_id": selected_doctor_id}
         ).mappings().first()
+        if not doctor:
+            return send_message(
+                "El médico seleccionado ya no está disponible.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+        slots = db.session.execute(
+            db.text("""
+                SELECT id, start_time, end_time
+                FROM slots
+                WHERE doctor_id = :doctor_id
+                AND is_available = TRUE
+                AND start_time > CURRENT_TIMESTAMP
+                ORDER BY start_time, id
+                LIMIT 10
+            """),
+            {"doctor_id": selected_doctor_id}
+        ).mappings().all()
 
-        specialty_id = temp_data.get("specialty_id")
+        if not slots:
+            return send_message(
+                f"Médico seleccionado: {doctor['full_name']}.\n\n"
+                "No hay horarios disponibles para este médico.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        import json
+        options_text = (
+            f"Médico seleccionado: {doctor['full_name']}.\n\n"
+            "Horarios disponibles:\n\n"
+        )
+
+        slots_map = {}
+
+        for index, slot in enumerate(slots, start=1):
+            date_text = slot["start_time"].strftime("%d/%m/%Y")
+            time_text = slot["start_time"].strftime("%H:%M")
+
+            options_text += f"{index}. {date_text} - {time_text}\n"
+            slots_map[str(index)] = slot["id"]
+
+        options_text += (
+            "\nSeleccione el número del horario que desea."
+        )
+        new_temp_data = {
+            "specialty_id": temp_data.get("specialty_id"),
+            "doctor_id": selected_doctor_id,
+            "slots": slots_map
+        }
+      
+        update_session(
+            sender_number,
+            current_step="BOOK_SELECT_SLOT",
+            temp_data=json.dumps(new_temp_data)
+        )
+
 
         update_session(
             sender_number,
-            current_step="BOOK_DOCTOR_SELECTED",
-            temp_data=f'{{"specialty_id": {specialty_id}, "doctor_id": {selected_doctor_id}}}'
+            current_step="BOOK_SELECT_SLOT",
+            temp_data=json.dumps(new_temp_data)
         )
+
+        return send_message(options_text)
+
+    if current_step == "BOOK_SELECT_SLOT":
+        temp_data = session["temp_data"]
+
+        slots_map = temp_data.get("slots", {})
+        selected_slot_id = slots_map.get(incoming_message)
+
+        if not selected_slot_id:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione un horario escribiendo solo "
+                "el número correspondiente."
+            )
+
+        slot = db.session.execute(
+            db.text("""
+                SELECT id, doctor_id, start_time, end_time
+                FROM slots
+                WHERE id = :slot_id
+                  AND doctor_id = :doctor_id
+                  AND is_available = TRUE
+                  AND start_time > CURRENT_TIMESTAMP
+            """),
+            {
+                "slot_id": selected_slot_id,
+                "doctor_id": temp_data.get("doctor_id")
+            }
+        ).mappings().first()
+
+        if not slot:
+            return send_message(
+                "El horario seleccionado ya no está disponible.\n\n"
+                "Escriba 'hola' para consultar nuevamente."
+            )
+
+        import json
+
+        new_temp_data = {
+            "specialty_id": temp_data.get("specialty_id"),
+            "doctor_id": temp_data.get("doctor_id"),
+            "slot_id": slot["id"]
+        }
+
+        update_session(
+            sender_number,
+            current_step="BOOK_SLOT_SELECTED",
+            temp_data=json.dumps(new_temp_data)
+        )
+
+        date_text = slot["start_time"].strftime("%d/%m/%Y")
+        time_text = slot["start_time"].strftime("%H:%M")
 
         return send_message(
-            f"Médico seleccionado: {doctor['full_name']}.\n\n"
-            "En el siguiente paso se mostrarán los horarios disponibles para este médico."
+            "Horario seleccionado correctamente.\n\n"
+            f"Fecha: {date_text}\n"
+            f"Hora: {time_text}\n\n"
+            "Su cita todavía NO ha sido reservada.\n"
+            "La confirmación se implementará "
+            "en el siguiente paso del proyecto."
         )
-
+        return send_message(options_text)
     return send_message(
         "No entendí su mensaje.\n\n"
         "Escriba 'hola' para iniciar nuevamente."
