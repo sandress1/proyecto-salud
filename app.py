@@ -181,6 +181,90 @@ def book_appointment(patient_id, doctor_id, slot_id):
         logging.exception("Error al reservar cita")
         return "error", None
 
+
+
+def cancel_appointment(patient_id, appointment_id):
+    """
+    Cancela una cita futura perteneciente al paciente.
+
+    Retorna:
+    ("success", appointment_id)
+    ("unavailable", None)
+    ("error", None)
+    """
+
+    try:
+    
+        slot = db.session.execute(
+            db.text("""
+                SELECT s.id
+                FROM slots s
+                JOIN appointments a ON a.slot_id = s.id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+                  AND a.status = 'booked'
+                  AND s.start_time > CURRENT_TIMESTAMP
+                FOR UPDATE OF s
+            """),
+            {
+                "appointment_id": appointment_id,
+                "patient_id": patient_id
+            }
+        ).mappings().first()
+
+        if not slot:
+            db.session.rollback()
+            return "unavailable", None
+        result = db.session.execute(
+            db.text("""
+                UPDATE appointments
+                SET status = 'cancelled',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :appointment_id
+                  AND patient_id = :patient_id
+                  AND slot_id = :slot_id
+                  AND status = 'booked'
+                RETURNING id
+            """),
+            {
+                "appointment_id": appointment_id,
+                "patient_id": patient_id,
+                "slot_id": slot["id"]
+            }
+        ).scalar_one_or_none()
+
+        if result is None:
+            db.session.rollback()
+            return "unavailable", None
+
+        db.session.execute(
+            db.text("""
+                UPDATE slots
+                SET is_available = TRUE
+                WHERE id = :slot_id
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM appointments
+                      WHERE slot_id = :slot_id
+                        AND status = 'booked'
+                  )
+            """),
+            {"slot_id": slot["id"]}
+        )
+
+    
+        db.session.commit()
+
+        return "success", appointment_id
+
+    except SQLAlchemyError:
+        db.session.rollback()
+        logging.exception("Error al cancelar cita")
+        return "error", None
+
+
+
+
 def main_menu(patient_name):
     return (
         f"Validación exitosa. Bienvenido/a, {patient_name}.\n\n"
@@ -339,12 +423,76 @@ def whatsapp():
                 "Este flujo se desarrollará más adelante."
             )
 
+ 
+
         if incoming_message == "3":
-            update_session(sender_number, current_step="CANCEL_START", selected_option="cancel")
-            return send_message(
+
+            appointments = db.session.execute(
+                db.text("""
+                    SELECT
+                        a.id,
+                        d.full_name AS doctor_name,
+                        sp.name AS specialty_name,
+                        s.start_time
+                    FROM appointments a
+                    JOIN doctors d ON d.id = a.doctor_id
+                    JOIN specialties sp ON sp.id = d.specialty_id
+                    JOIN slots s ON s.id = a.slot_id
+                    WHERE a.patient_id = :patient_id
+                      AND a.status = 'booked'
+                      AND s.start_time > CURRENT_TIMESTAMP
+                    ORDER BY s.start_time, a.id
+                """),
+                {"patient_id": session["patient_id"]}
+            ).mappings().all()
+
+            if not appointments:
+                return send_message(
+                    "No tiene citas médicas activas "
+                    "pendientes por cancelar.\n\n"
+                    "Escriba 'hola' para volver al menú."
+                )
+
+            import json
+
+            options_text = (
                 "Ha seleccionado: Cancelar cita médica.\n\n"
-                "Este flujo se desarrollará más adelante."
+                "Estas son sus citas activas:\n\n"
             )
+
+            appointments_map = {}
+
+            for index, appointment in enumerate(appointments, start=1):
+                date_text = appointment["start_time"].strftime("%d/%m/%Y")
+                time_text = appointment["start_time"].strftime("%H:%M")
+
+                options_text += (
+                    f"{index}. {appointment['specialty_name']}\n"
+                    f"Médico: {appointment['doctor_name']}\n"
+                    f"Fecha: {date_text}\n"
+                    f"Hora: {time_text}\n"
+                    f"Número de cita: {appointment['id']}\n\n"
+                )
+
+                appointments_map[str(index)] = appointment["id"]
+
+            new_temp_data = {
+                "appointments": appointments_map
+            }
+
+            update_session(
+                sender_number,
+                current_step="CANCEL_SELECT_APPOINTMENT",
+                selected_option="cancel",
+                temp_data=json.dumps(new_temp_data)
+            )
+
+            return send_message(
+                options_text
+                + "Seleccione el número de la cita que desea cancelar."
+            )
+
+
 
         if incoming_message == "4":
             update_session(sender_number, current_step="PQR_START", selected_option="feedback")
@@ -692,6 +840,168 @@ def whatsapp():
             "Su cita ha quedado confirmada.\n\n"
             "Escriba 'hola' para iniciar nuevamente."
         )
+
+
+
+    if current_step == "CANCEL_SELECT_APPOINTMENT":
+
+        temp_data = session["temp_data"]
+
+        appointments_map = temp_data.get("appointments", {})
+        selected_appointment_id = appointments_map.get(incoming_message)
+
+        if not selected_appointment_id:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione una cita escribiendo solo "
+                "el número correspondiente."
+            )
+
+        appointment = db.session.execute(
+            db.text("""
+                SELECT
+                    a.id,
+                    d.full_name AS doctor_name,
+                    sp.name AS specialty_name,
+                    s.start_time
+                FROM appointments a
+                JOIN doctors d ON d.id = a.doctor_id
+                JOIN specialties sp ON sp.id = d.specialty_id
+                JOIN slots s ON s.id = a.slot_id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+                  AND a.status = 'booked'
+                  AND s.start_time > CURRENT_TIMESTAMP
+            """),
+            {
+                "appointment_id": selected_appointment_id,
+                "patient_id": session["patient_id"]
+            }
+        ).mappings().first()
+
+        if not appointment:
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="cancel",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "La cita seleccionada ya no está disponible "
+                "para cancelación.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        import json
+
+        new_temp_data = {
+            "appointment_id": appointment["id"]
+        }
+
+        update_session(
+            sender_number,
+            current_step="CANCEL_CONFIRM",
+            selected_option="cancel",
+            temp_data=json.dumps(new_temp_data)
+        )
+
+        date_text = appointment["start_time"].strftime("%d/%m/%Y")
+        time_text = appointment["start_time"].strftime("%H:%M")
+
+        return send_message(
+            "Ha seleccionado la siguiente cita:\n\n"
+            f"Número de cita: {appointment['id']}\n"
+            f"Especialidad: {appointment['specialty_name']}\n"
+            f"Médico: {appointment['doctor_name']}\n"
+            f"Fecha: {date_text}\n"
+            f"Hora: {time_text}\n\n"
+            "¿Está seguro de que desea cancelar esta cita?\n\n"
+            "1. Sí, cancelar cita\n"
+            "2. No, conservar cita\n\n"
+            "Responda con 1 o 2."
+        )
+
+
+
+    if current_step == "CANCEL_CONFIRM":
+
+        if incoming_message == "2":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="cancel",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "Ha decidido conservar su cita médica.\n\n"
+                "Su cita continúa confirmada.\n\n"
+                "Escriba 'hola' para volver al menú."
+            )
+
+        if incoming_message != "1":
+            return send_message(
+                "Opción no válida.\n\n"
+                "1. Sí, cancelar cita\n"
+                "2. No, conservar cita"
+            )
+
+        temp_data = session["temp_data"]
+        appointment_id = temp_data.get("appointment_id")
+        patient_id = session["patient_id"]
+
+        if not appointment_id or not patient_id:
+            reset_session(sender_number)
+
+            return send_message(
+                "No fue posible recuperar los datos "
+                "de la cita.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        status, cancelled_id = cancel_appointment(
+            patient_id,
+            appointment_id
+        )
+
+        if status == "unavailable":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="cancel",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "La cita ya fue cancelada o no está "
+                "disponible para cancelación.\n\n"
+                "No se realizaron cambios.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        if status == "error":
+            return send_message(
+                "Ocurrió un error al intentar cancelar "
+                "su cita médica.\n\n"
+                "Por favor, intente nuevamente."
+            )
+
+        update_session(
+            sender_number,
+            current_step="MAIN_MENU",
+            selected_option="cancel",
+            temp_data="{}"
+        )
+
+        return send_message(
+            "¡Cita médica cancelada exitosamente!\n\n"
+            f"Número de cita: {cancelled_id}\n\n"
+            "El horario ha quedado disponible "
+            "para otros pacientes.\n\n"
+            "Escriba 'hola' para volver al menú."
+        )
+
 
 
     return send_message(
