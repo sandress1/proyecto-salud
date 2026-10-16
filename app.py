@@ -264,6 +264,191 @@ def cancel_appointment(patient_id, appointment_id):
 
 
 
+def modify_appointment(
+    patient_id,
+    appointment_id,
+    old_slot_id,
+    new_slot_id
+):
+    """
+    Modifica una cita médica en una transacción segura.
+
+    Retorna:
+    ("success", appointment_id)
+    ("unavailable", None)
+    ("error", None)
+    """
+
+    try:
+      
+        appointment = db.session.execute(
+            db.text("""
+                SELECT a.id, a.doctor_id, a.slot_id
+                FROM appointments a
+                JOIN slots s ON s.id = a.slot_id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+                  AND a.status = 'booked'
+                  AND a.slot_id = :old_slot_id
+                  AND s.start_time > CURRENT_TIMESTAMP
+            """),
+            {
+                "appointment_id": appointment_id,
+                "patient_id": patient_id,
+                "old_slot_id": old_slot_id
+            }
+        ).mappings().first()
+
+        if not appointment or old_slot_id == new_slot_id:
+            db.session.rollback()
+            return "unavailable", None
+
+      
+        locked_slots = db.session.execute(
+            db.text("""
+                SELECT id, doctor_id, start_time, is_available
+                FROM slots
+                WHERE id IN (:old_slot_id, :new_slot_id)
+                ORDER BY id
+                FOR UPDATE
+            """),
+            {
+                "old_slot_id": old_slot_id,
+                "new_slot_id": new_slot_id
+            }
+        ).mappings().all()
+
+        slots_by_id = {
+            slot["id"]: slot for slot in locked_slots
+        }
+
+        old_slot = slots_by_id.get(old_slot_id)
+        new_slot = slots_by_id.get(new_slot_id)
+
+        if not old_slot or not new_slot:
+            db.session.rollback()
+            return "unavailable", None
+
+        current_appointment = db.session.execute(
+            db.text("""
+                SELECT a.id
+                FROM appointments a
+                JOIN slots s ON s.id = a.slot_id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+                  AND a.status = 'booked'
+                  AND a.slot_id = :old_slot_id
+                  AND s.start_time > CURRENT_TIMESTAMP
+                FOR UPDATE OF a
+            """),
+            {
+                "appointment_id": appointment_id,
+                "patient_id": patient_id,
+                "old_slot_id": old_slot_id
+            }
+        ).mappings().first()
+
+        if not current_appointment:
+            db.session.rollback()
+            return "unavailable", None
+
+        new_slot_is_future = db.session.execute(
+            db.text("""
+                SELECT start_time > CURRENT_TIMESTAMP
+                FROM slots
+                WHERE id = :new_slot_id
+            """),
+            {"new_slot_id": new_slot_id}
+        ).scalar()
+
+       
+        if (
+            new_slot["doctor_id"] != appointment["doctor_id"]
+            or not new_slot["is_available"]
+            or not new_slot_is_future
+        ):
+            db.session.rollback()
+            return "unavailable", None
+
+        existing = db.session.execute(
+            db.text("""
+                SELECT id
+                FROM appointments
+                WHERE slot_id = :new_slot_id
+                  AND status = 'booked'
+            """),
+            {"new_slot_id": new_slot_id}
+        ).first()
+
+        if existing:
+            db.session.rollback()
+            return "unavailable", None
+
+        result = db.session.execute(
+            db.text("""
+                UPDATE appointments
+                SET slot_id = :new_slot_id,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :appointment_id
+                  AND patient_id = :patient_id
+                  AND slot_id = :old_slot_id
+                  AND status = 'booked'
+                RETURNING id
+            """),
+            {
+                "new_slot_id": new_slot_id,
+                "appointment_id": appointment_id,
+                "patient_id": patient_id,
+                "old_slot_id": old_slot_id
+            }
+        ).scalar_one_or_none()
+
+        if result is None:
+            db.session.rollback()
+            return "unavailable", None
+
+        db.session.execute(
+            db.text("""
+                UPDATE slots
+                SET is_available = FALSE
+                WHERE id = :new_slot_id
+            """),
+            {"new_slot_id": new_slot_id}
+        )
+
+        db.session.execute(
+            db.text("""
+                UPDATE slots
+                SET is_available = TRUE
+                WHERE id = :old_slot_id
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM appointments
+                      WHERE slot_id = :old_slot_id
+                        AND status = 'booked'
+                  )
+            """),
+            {"old_slot_id": old_slot_id}
+        )
+
+        db.session.commit()
+
+        return "success", appointment_id
+
+    except IntegrityError:
+        db.session.rollback()
+        return "unavailable", None
+
+    except SQLAlchemyError:
+        db.session.rollback()
+        logging.exception("Error al modificar cita")
+        return "error", None
+
+
+
+
+
+
 
 def main_menu(patient_name):
     return (
@@ -1319,24 +1504,119 @@ def whatsapp():
                 "Escriba 'hola' para iniciar nuevamente."
             )
 
-        if incoming_message == "1":
+        if incoming_message != "1":
             return send_message(
-                "La confirmación de modificaciones "
-                "estará disponible en el siguiente "
-                "paso del proyecto.\n\n"
-                "Su cita actual permanece sin cambios.\n\n"
-                "Puede responder 2 para conservar su cita "
-                "o escribir 'hola' para iniciar nuevamente."
+                "Opción no válida.\n\n"
+                "1. Sí, confirmar modificación\n"
+                "2. No, conservar mi cita actual"
             )
 
-        return send_message(
-            "Opción no válida.\n\n"
-            "1. Sí, confirmar modificación\n"
-            "2. No, conservar mi cita actual"
+        temp_data = session["temp_data"]
+
+        patient_id = session["patient_id"]
+        appointment_id = temp_data.get("appointment_id")
+        old_slot_id = temp_data.get("old_slot_id")
+        new_slot_id = temp_data.get("new_slot_id")
+
+        if not all([
+            patient_id,
+            appointment_id,
+            old_slot_id,
+            new_slot_id
+        ]):
+            reset_session(sender_number)
+
+            return send_message(
+                "No fue posible recuperar los datos "
+                "de la modificación.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        status, modified_id = modify_appointment(
+            patient_id,
+            appointment_id,
+            old_slot_id,
+            new_slot_id
         )
 
+        if status == "unavailable":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="modify",
+                temp_data="{}"
+            )
 
+            return send_message(
+                "No fue posible modificar su cita.\n\n"
+                "El horario seleccionado ya no está "
+                "disponible o la cita original cambió.\n\n"
+                "No se realizó la modificación.\n\n"
+                "Escriba 'hola' para consultar "
+                "otros horarios."
+            )
 
+        if status == "error":
+            return send_message(
+                "Ocurrió un error al modificar su cita.\n\n"
+                "No se pudo confirmar el cambio.\n\n"
+                "Por favor, intente nuevamente."
+            )
+
+        appointment = db.session.execute(
+            db.text("""
+                SELECT
+                    a.id,
+                    d.full_name AS doctor_name,
+                    sp.name AS specialty_name,
+                    s.start_time
+                FROM appointments a
+                JOIN doctors d ON d.id = a.doctor_id
+                JOIN specialties sp ON sp.id = d.specialty_id
+                JOIN slots s ON s.id = a.slot_id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+            """),
+            {
+                "appointment_id": modified_id,
+                "patient_id": patient_id
+            }
+        ).mappings().first()
+
+        update_session(
+            sender_number,
+            current_step="MAIN_MENU",
+            selected_option="modify",
+            temp_data="{}"
+        )
+
+        if not appointment:
+            return send_message(
+                "La modificación fue guardada correctamente, "
+                "pero no fue posible consultar los detalles "
+                "de la cita.\n\n"
+                f"Número de cita: {modified_id}\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        date_text = appointment["start_time"].strftime(
+            "%d/%m/%Y"
+        )
+
+        time_text = appointment["start_time"].strftime(
+            "%H:%M"
+        )
+
+        return send_message(
+            "¡Cita médica modificada exitosamente!\n\n"
+            f"Número de cita: {modified_id}\n"
+            f"Especialidad: {appointment['specialty_name']}\n"
+            f"Médico: {appointment['doctor_name']}\n"
+            f"Nueva fecha: {date_text}\n"
+            f"Nueva hora: {time_text}\n\n"
+            "Su cita ha sido actualizada correctamente.\n\n"
+            "Escriba 'hola' para volver al menú."
+        )
 
     return send_message(
         "No entendí su mensaje.\n\n"
