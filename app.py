@@ -416,14 +416,74 @@ def whatsapp():
 
             return send_message(options_text)
 
+    
+    
         if incoming_message == "2":
-            update_session(sender_number, current_step="MODIFY_START", selected_option="modify")
-            return send_message(
+
+            appointments = db.session.execute(
+                db.text("""
+                    SELECT
+                        a.id,
+                        d.full_name AS doctor_name,
+                        sp.name AS specialty_name,
+                        s.start_time
+                    FROM appointments a
+                    JOIN doctors d ON d.id = a.doctor_id
+                    JOIN specialties sp ON sp.id = d.specialty_id
+                    JOIN slots s ON s.id = a.slot_id
+                    WHERE a.patient_id = :patient_id
+                      AND a.status = 'booked'
+                      AND s.start_time > CURRENT_TIMESTAMP
+                    ORDER BY s.start_time, a.id
+                """),
+                {"patient_id": session["patient_id"]}
+            ).mappings().all()
+
+            if not appointments:
+                return send_message(
+                    "No tiene citas médicas activas "
+                    "disponibles para modificar.\n\n"
+                    "Escriba 'hola' para iniciar nuevamente."
+                )
+
+            import json
+
+            options_text = (
                 "Ha seleccionado: Modificar cita médica.\n\n"
-                "Este flujo se desarrollará más adelante."
+                "Estas son sus citas activas:\n\n"
             )
 
- 
+            appointments_map = {}
+
+            for index, appointment in enumerate(appointments, start=1):
+                date_text = appointment["start_time"].strftime("%d/%m/%Y")
+                time_text = appointment["start_time"].strftime("%H:%M")
+
+                options_text += (
+                    f"{index}. {appointment['specialty_name']}\n"
+                    f"Médico: {appointment['doctor_name']}\n"
+                    f"Fecha: {date_text}\n"
+                    f"Hora: {time_text}\n"
+                    f"Número de cita: {appointment['id']}\n\n"
+                )
+
+                appointments_map[str(index)] = appointment["id"]
+
+            update_session(
+                sender_number,
+                current_step="MODIFY_SELECT_APPOINTMENT",
+                selected_option="modify",
+                temp_data=json.dumps({
+                    "appointments": appointments_map
+                })
+            )
+
+            return send_message(
+                options_text
+                + "Seleccione el número de la cita que desea modificar."
+            )
+
+
 
         if incoming_message == "3":
 
@@ -1001,6 +1061,280 @@ def whatsapp():
             "para otros pacientes.\n\n"
             "Escriba 'hola' para volver al menú."
         )
+
+
+
+    if current_step == "MODIFY_SELECT_APPOINTMENT":
+
+        temp_data = session["temp_data"]
+        appointments_map = temp_data.get("appointments", {})
+
+        selected_appointment_id = appointments_map.get(incoming_message)
+
+        if not selected_appointment_id:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione una cita escribiendo solo "
+                "el número correspondiente."
+            )
+
+        appointment = db.session.execute(
+            db.text("""
+                SELECT
+                    a.id,
+                    a.doctor_id,
+                    a.slot_id,
+                    d.full_name AS doctor_name,
+                    sp.name AS specialty_name,
+                    s.start_time
+                FROM appointments a
+                JOIN doctors d ON d.id = a.doctor_id
+                JOIN specialties sp ON sp.id = d.specialty_id
+                JOIN slots s ON s.id = a.slot_id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+                  AND a.status = 'booked'
+                  AND s.start_time > CURRENT_TIMESTAMP
+            """),
+            {
+                "appointment_id": selected_appointment_id,
+                "patient_id": session["patient_id"]
+            }
+        ).mappings().first()
+
+        if not appointment:
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="modify",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "La cita seleccionada ya no está "
+                "disponible para modificación.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        slots = db.session.execute(
+            db.text("""
+                SELECT id, start_time, end_time
+                FROM slots
+                WHERE doctor_id = :doctor_id
+                  AND is_available = TRUE
+                  AND start_time > CURRENT_TIMESTAMP
+                  AND id <> :current_slot_id
+                ORDER BY start_time, id
+                LIMIT 10
+            """),
+            {
+                "doctor_id": appointment["doctor_id"],
+                "current_slot_id": appointment["slot_id"]
+            }
+        ).mappings().all()
+
+        if not slots:
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="modify",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "No hay otros horarios disponibles "
+                "para este médico.\n\n"
+                "Su cita actual permanece confirmada.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        import json
+
+        options_text = (
+            "Ha seleccionado modificar la siguiente cita:\n\n"
+            f"Número de cita: {appointment['id']}\n"
+            f"Especialidad: {appointment['specialty_name']}\n"
+            f"Médico: {appointment['doctor_name']}\n"
+            f"Fecha actual: "
+            f"{appointment['start_time'].strftime('%d/%m/%Y')}\n"
+            f"Hora actual: "
+            f"{appointment['start_time'].strftime('%H:%M')}\n\n"
+            "Horarios disponibles para cambiar su cita:\n\n"
+        )
+
+        slots_map = {}
+
+        for index, slot in enumerate(slots, start=1):
+            date_text = slot["start_time"].strftime("%d/%m/%Y")
+            time_text = slot["start_time"].strftime("%H:%M")
+
+            options_text += f"{index}. {date_text} - {time_text}\n"
+
+            slots_map[str(index)] = slot["id"]
+
+        options_text += (
+            "\nSeleccione el número del nuevo horario."
+        )
+
+        new_temp_data = {
+            "appointment_id": appointment["id"],
+            "doctor_id": appointment["doctor_id"],
+            "old_slot_id": appointment["slot_id"],
+            "slots": slots_map
+        }
+
+        update_session(
+            sender_number,
+            current_step="MODIFY_SELECT_SLOT",
+            selected_option="modify",
+            temp_data=json.dumps(new_temp_data)
+        )
+
+        return send_message(options_text)
+
+
+
+    if current_step == "MODIFY_SELECT_SLOT":
+
+        temp_data = session["temp_data"]
+        slots_map = temp_data.get("slots", {})
+
+        selected_slot_id = slots_map.get(incoming_message)
+
+        if not selected_slot_id:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione un nuevo horario escribiendo "
+                "solo el número correspondiente."
+            )
+
+        appointment = db.session.execute(
+            db.text("""
+                SELECT
+                    a.id,
+                    a.doctor_id,
+                    a.slot_id,
+                    s.start_time AS old_start_time,
+                    d.full_name AS doctor_name,
+                    sp.name AS specialty_name
+                FROM appointments a
+                JOIN slots s ON s.id = a.slot_id
+                JOIN doctors d ON d.id = a.doctor_id
+                JOIN specialties sp ON sp.id = d.specialty_id
+                WHERE a.id = :appointment_id
+                  AND a.patient_id = :patient_id
+                  AND a.status = 'booked'
+                  AND s.start_time > CURRENT_TIMESTAMP
+            """),
+            {
+                "appointment_id": temp_data.get("appointment_id"),
+                "patient_id": session["patient_id"]
+            }
+        ).mappings().first()
+
+        if not appointment:
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="modify",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "La cita original ya no está disponible "
+                "para modificación.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        new_slot = db.session.execute(
+            db.text("""
+                SELECT id, doctor_id, start_time
+                FROM slots
+                WHERE id = :slot_id
+                  AND doctor_id = :doctor_id
+                  AND is_available = TRUE
+                  AND start_time > CURRENT_TIMESTAMP
+            """),
+            {
+                "slot_id": selected_slot_id,
+                "doctor_id": appointment["doctor_id"]
+            }
+        ).mappings().first()
+
+        if not new_slot:
+            return send_message(
+                "El nuevo horario seleccionado "
+                "ya no está disponible.\n\n"
+                "Escriba 'hola' para consultar nuevamente."
+            )
+
+        import json
+
+        update_session(
+            sender_number,
+            current_step="MODIFY_CONFIRM",
+            selected_option="modify",
+            temp_data=json.dumps({
+                "appointment_id": appointment["id"],
+                "doctor_id": appointment["doctor_id"],
+                "old_slot_id": appointment["slot_id"],
+                "new_slot_id": new_slot["id"]
+            })
+        )
+
+        old_date = appointment["old_start_time"].strftime("%d/%m/%Y")
+        old_time = appointment["old_start_time"].strftime("%H:%M")
+
+        new_date = new_slot["start_time"].strftime("%d/%m/%Y")
+        new_time = new_slot["start_time"].strftime("%H:%M")
+
+        return send_message(
+            "Resumen de modificación de cita médica:\n\n"
+            f"Número de cita: {appointment['id']}\n"
+            f"Especialidad: {appointment['specialty_name']}\n"
+            f"Médico: {appointment['doctor_name']}\n\n"
+            f"Horario actual: {old_date} - {old_time}\n"
+            f"Nuevo horario: {new_date} - {new_time}\n\n"
+            "¿Desea confirmar este cambio?\n\n"
+            "1. Sí, confirmar modificación\n"
+            "2. No, conservar mi cita actual\n\n"
+            "Su cita todavía NO ha sido modificada."
+        )
+
+
+
+    if current_step == "MODIFY_CONFIRM":
+
+        if incoming_message == "2":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option="modify",
+                temp_data="{}"
+            )
+
+            return send_message(
+                "Ha decidido conservar su cita actual.\n\n"
+                "No se realizaron modificaciones.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        if incoming_message == "1":
+            return send_message(
+                "La confirmación de modificaciones "
+                "estará disponible en el siguiente "
+                "paso del proyecto.\n\n"
+                "Su cita actual permanece sin cambios.\n\n"
+                "Puede responder 2 para conservar su cita "
+                "o escribir 'hola' para iniciar nuevamente."
+            )
+
+        return send_message(
+            "Opción no válida.\n\n"
+            "1. Sí, confirmar modificación\n"
+            "2. No, conservar mi cita actual"
+        )
+
 
 
 
