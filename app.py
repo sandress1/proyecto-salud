@@ -447,6 +447,59 @@ def modify_appointment(
 
 
 
+def save_feedback(patient_id, feedback_type, message):
+   
+    allowed_types = {
+        "peticion",
+        "queja",
+        "reclamo",
+        "sugerencia",
+        "comentario"
+    }
+
+    if feedback_type not in allowed_types:
+        return "invalid", None
+
+    message = message.strip()
+
+    if len(message) < 10 or len(message) > 1000:
+        return "invalid", None
+
+    try:
+        feedback_id = db.session.execute(
+            db.text("""
+                INSERT INTO feedback_pqrs (
+                    patient_id,
+                    feedback_type,
+                    message,
+                    status
+                )
+                VALUES (
+                    :patient_id,
+                    :feedback_type,
+                    :message,
+                    'pending'
+                )
+                RETURNING id
+            """),
+            {
+                "patient_id": patient_id,
+                "feedback_type": feedback_type,
+                "message": message
+            }
+        ).scalar_one()
+
+        db.session.commit()
+
+        return "success", feedback_id
+
+    except SQLAlchemyError:
+        db.session.rollback()
+        logging.exception("Error al registrar PQR")
+        return "error", None
+
+
+
 
 
 
@@ -739,12 +792,28 @@ def whatsapp():
 
 
 
+
         if incoming_message == "4":
-            update_session(sender_number, current_step="PQR_START", selected_option="feedback")
+
+            update_session(
+                sender_number,
+                current_step="PQR_SELECT_TYPE",
+                selected_option="feedback",
+                temp_data="{}"
+            )
+
             return send_message(
                 "Ha seleccionado: Registrar PQR o comentario.\n\n"
-                "Este flujo se desarrollará más adelante."
+                "Seleccione el tipo de solicitud:\n\n"
+                "1. Petición\n"
+                "2. Queja\n"
+                "3. Reclamo\n"
+                "4. Sugerencia\n"
+                "5. Comentario\n\n"
+                "Responda con el número correspondiente."
             )
+
+
 
         return send_message(
             "Opción no válida.\n\n"
@@ -1617,6 +1686,198 @@ def whatsapp():
             "Su cita ha sido actualizada correctamente.\n\n"
             "Escriba 'hola' para volver al menú."
         )
+
+
+
+    if current_step == "PQR_SELECT_TYPE":
+
+        feedback_types = {
+            "1": ("peticion", "Petición"),
+            "2": ("queja", "Queja"),
+            "3": ("reclamo", "Reclamo"),
+            "4": ("sugerencia", "Sugerencia"),
+            "5": ("comentario", "Comentario")
+        }
+
+        selected_type = feedback_types.get(incoming_message)
+
+        if not selected_type:
+            return send_message(
+                "Opción no válida.\n\n"
+                "Seleccione un tipo de solicitud:\n\n"
+                "1. Petición\n"
+                "2. Queja\n"
+                "3. Reclamo\n"
+                "4. Sugerencia\n"
+                "5. Comentario"
+            )
+
+        feedback_type, feedback_label = selected_type
+
+        import json
+
+        update_session(
+            sender_number,
+            current_step="PQR_WRITE_MESSAGE",
+            selected_option="feedback",
+            temp_data=json.dumps({
+                "feedback_type": feedback_type,
+                "feedback_label": feedback_label
+            }, ensure_ascii=False)
+        )
+
+        return send_message(
+            f"Ha seleccionado: {feedback_label}.\n\n"
+            "Por favor, escriba su mensaje explicando "
+            "su solicitud o experiencia.\n\n"
+            "El mensaje debe contener entre 10 y "
+            "1.000 caracteres.\n\n"
+            "Evite incluir contraseñas o información "
+            "médica sensible."
+        )
+
+
+
+    if current_step == "PQR_WRITE_MESSAGE":
+
+        temp_data = session["temp_data"]
+
+        feedback_type = temp_data.get("feedback_type")
+        feedback_label = temp_data.get("feedback_label")
+
+        if not feedback_type or not feedback_label:
+            reset_session(sender_number)
+
+            return send_message(
+                "No fue posible recuperar el tipo "
+                "de solicitud.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        feedback_message = incoming_message.strip()
+
+        if len(feedback_message) < 10:
+            return send_message(
+                "Su mensaje es demasiado corto.\n\n"
+                "Por favor, escriba al menos "
+                "10 caracteres explicando su solicitud."
+            )
+
+        if len(feedback_message) > 1000:
+            return send_message(
+                "Su mensaje supera el límite permitido.\n\n"
+                "Por favor, escriba un mensaje "
+                "de máximo 1.000 caracteres."
+            )
+
+        import json
+
+        update_session(
+            sender_number,
+            current_step="PQR_CONFIRM",
+            selected_option="feedback",
+            temp_data=json.dumps({
+                "feedback_type": feedback_type,
+                "feedback_label": feedback_label,
+                "message": feedback_message
+            }, ensure_ascii=False)
+        )
+
+        return send_message(
+            "Resumen de su solicitud:\n\n"
+            f"Tipo: {feedback_label}\n\n"
+            f"Mensaje:\n{feedback_message}\n\n"
+            "¿Desea enviar esta solicitud?\n\n"
+            "1. Sí, enviar\n"
+            "2. No, cancelar\n\n"
+            "Responda con 1 o 2."
+        )
+
+
+
+    if current_step == "PQR_CONFIRM":
+
+        if incoming_message == "2":
+            update_session(
+                sender_number,
+                current_step="MAIN_MENU",
+                selected_option=None,
+                temp_data="{}"
+            )
+
+            return send_message(
+                "El registro de su solicitud fue cancelado.\n\n"
+                "No se guardó ninguna PQR o comentario.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        if incoming_message != "1":
+            return send_message(
+                "Opción no válida.\n\n"
+                "1. Sí, enviar\n"
+                "2. No, cancelar"
+            )
+
+        temp_data = session["temp_data"]
+
+        patient_id = session["patient_id"]
+        feedback_type = temp_data.get("feedback_type")
+        feedback_label = temp_data.get("feedback_label")
+        feedback_message = temp_data.get("message")
+
+        if (
+            not patient_id
+            or not feedback_type
+            or not feedback_label
+            or not feedback_message
+        ):
+            reset_session(sender_number)
+
+            return send_message(
+                "No fue posible recuperar los datos "
+                "de su solicitud.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        status, feedback_id = save_feedback(
+            patient_id,
+            feedback_type,
+            feedback_message
+        )
+
+        if status == "invalid":
+            return send_message(
+                "Los datos de su solicitud no son válidos.\n\n"
+                "Escriba 'hola' para iniciar nuevamente."
+            )
+
+        if status == "error":
+            return send_message(
+                "Ocurrió un error al registrar su solicitud.\n\n"
+                "No se pudo confirmar el registro.\n\n"
+                "Por favor, intente nuevamente."
+            )
+
+        update_session(
+            sender_number,
+            current_step="MAIN_MENU",
+            selected_option=None,
+            temp_data="{}"
+        )
+
+        return send_message(
+            "¡Solicitud registrada exitosamente!\n\n"
+            f"Número de radicado: {feedback_id}\n"
+            f"Tipo: {feedback_label}\n"
+            "Estado: Pendiente\n\n"
+            "Gracias por compartir su opinión.\n\n"
+            "Conserve el número de radicado "
+            "para futuras consultas.\n\n"
+            "Escriba 'hola' para volver al menú."
+        )
+
+
+
 
     return send_message(
         "No entendí su mensaje.\n\n"
